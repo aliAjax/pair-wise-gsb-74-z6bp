@@ -6,6 +6,7 @@ import type {
   GovernanceState,
   ReleaseCandidate,
 } from './domain'
+import { freezeReleaseSnapshot } from '@/services/releaseSnapshot'
 
 const events: EventDefinition[] = [
   {
@@ -787,6 +788,14 @@ const releases: ReleaseCandidate[] = [
     status: 'reviewing',
     eventIds: ['evt-001', 'evt-003', 'evt-005'],
     affectedDependencyIds: ['dep-001', 'dep-004', 'dep-005', 'dep-006'],
+    snapshot: freezeReleaseSnapshot(
+      events,
+      dependencies,
+      ['evt-001', 'evt-003', 'evt-005'],
+      ['dep-001', 'dep-004', 'dep-005', 'dep-006'],
+    ),
+    revision: 1,
+    processedSubmissionIds: [],
     differences: [
       {
         eventId: 'evt-001',
@@ -882,6 +891,14 @@ const releases: ReleaseCandidate[] = [
     status: 'published',
     eventIds: ['evt-002', 'evt-004', 'evt-006'],
     affectedDependencyIds: ['dep-002', 'dep-003'],
+    snapshot: freezeReleaseSnapshot(
+      events,
+      dependencies,
+      ['evt-002', 'evt-004', 'evt-006'],
+      ['dep-002', 'dep-003'],
+    ),
+    revision: 1,
+    processedSubmissionIds: [],
     differences: [],
     migrationConfirmations: [
       {
@@ -1048,6 +1065,7 @@ export const createSeedState = (): GovernanceState => ({
       createdAt: '2026-08-19T18:20:00+08:00',
       status: 'verified',
       evidence: 'RPT-INCIDENT-8821 / MOBILE-REL-2026-0819',
+      restoredEventIds: ['evt-003'],
     },
   ],
   audit,

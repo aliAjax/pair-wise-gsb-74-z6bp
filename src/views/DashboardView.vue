@@ -31,7 +31,7 @@ const pendingMigrations = computed(
     currentRelease.value?.migrationConfirmations.filter((item) => item.status !== 'confirmed') ?? [],
 )
 const pendingApprovals = computed(
-  () => currentRelease.value?.approvals.filter((item) => item.status === 'pending') ?? [],
+  () => currentRelease.value?.approvals.filter((item) => item.status !== 'approved') ?? [],
 )
 </script>
 

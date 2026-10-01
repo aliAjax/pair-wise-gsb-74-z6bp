@@ -126,6 +126,9 @@ const verify = async (): Promise<void> => {
               <StatusTag :value="record.status" />
             </div>
             <p>{{ record.reason }}</p>
+            <p v-if="record.restoredEventIds.length > 0" class="restored-note">
+              已按候选冻结内容恢复 {{ record.restoredEventIds.length }} 个事件契约。
+            </p>
             <dl>
               <div>
                 <dt>影响范围</dt>
@@ -297,6 +300,11 @@ const verify = async (): Promise<void> => {
   margin: 0;
   color: #596579;
   font-size: 13px;
+}
+
+.rollback-main .restored-note {
+  color: #1264c5;
+  font-size: 12px;
 }
 
 .rollback-main dl {

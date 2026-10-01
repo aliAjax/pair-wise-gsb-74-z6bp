@@ -7,36 +7,43 @@ import StatusTag from '@/components/StatusTag.vue'
 import { useGovernanceStore } from '@/stores/governance'
 
 const store = useGovernanceStore()
-const selectedEventIds = ref(
-  store.data.events
-    .filter((event) => ['approved', 'published', 'reviewing'].includes(event.status))
-    .map((event) => event.id),
+const releaseId = ref(
+  store.data.releases.find((release) => release.status === 'reviewing')?.id ??
+    store.data.releases[0]?.id ??
+    '',
 )
+const release = computed(
+  () => store.data.releases.find((item) => item.id === releaseId.value) ?? null,
+)
+const selectedEventIds = ref<string[]>([])
 const format = ref<'json' | 'markdown'>('json')
-const includeDeprecated = ref(false)
 
-const eligibleEvents = computed(() =>
-  store.data.events.filter((event) => includeDeprecated.value || event.status !== 'retired'),
+const frozenEvents = computed(() => release.value?.snapshot.events ?? [])
+
+watch(
+  release,
+  (value) => {
+    selectedEventIds.value = value ? value.snapshot.events.map((event) => event.eventId) : []
+  },
+  { immediate: true },
 )
-
-watch(includeDeprecated, () => {
-  selectedEventIds.value = selectedEventIds.value.filter((id) =>
-    eligibleEvents.value.some((event) => event.id === id),
-  )
-})
 
 const markdown = computed(() => {
-  const events = store.data.events.filter((event) => selectedEventIds.value.includes(event.id))
+  if (!release.value) return ''
+  const events = frozenEvents.value.filter((event) => selectedEventIds.value.includes(event.eventId))
   return [
-    `# 埋点事件契约 ${store.data.currentVersion}`,
+    `# 埋点事件契约 ${release.value.version}（送审冻结）`,
+    '',
+    `- 血缘摘要：#${release.value.snapshot.overallDigest}`,
+    `- 冻结时间：${new Date(release.value.snapshot.frozenAt).toLocaleString('zh-CN')}`,
     '',
     ...events.flatMap((event) => [
       `## ${event.displayName} (\`${event.key}\`)`,
       '',
       `- 版本：${event.version}`,
       `- 负责人：${event.owner}`,
-      `- 状态：${event.status}`,
       `- 触发时机：${event.trigger}`,
+      `- 事件摘要：#${event.digest}`,
       '',
       '| 属性 | 类型 | 必填 | 枚举 | 说明 |',
       '| --- | --- | --- | --- | --- |',
@@ -58,11 +65,18 @@ const markdown = computed(() => {
   ].join('\n')
 })
 
-const output = computed(() =>
-  format.value === 'json' ? store.exportContract(selectedEventIds.value) : markdown.value,
-)
+const output = computed(() => {
+  if (!release.value) return ''
+  return format.value === 'json'
+    ? store.exportContract(release.value.id, selectedEventIds.value)
+    : markdown.value
+})
 
 const download = async (): Promise<void> => {
+  if (!release.value) {
+    await MessagePlugin.error('请先选择发布候选')
+    return
+  }
   if (selectedEventIds.value.length === 0) {
     await MessagePlugin.error('至少选择一个事件')
     return
@@ -76,10 +90,10 @@ const download = async (): Promise<void> => {
   const url = URL.createObjectURL(blob)
   const anchor = document.createElement('a')
   anchor.href = url
-  anchor.download = `event-contract-${store.data.currentVersion}.${extension}`
+  anchor.download = `event-contract-${release.value.version}-frozen.${extension}`
   anchor.click()
   URL.revokeObjectURL(url)
-  await MessagePlugin.success('契约文件已导出')
+  await MessagePlugin.success('已按送审冻结内容导出契约文件')
 }
 
 const setExportSelection = (eventId: string, checked: unknown): void => {
@@ -94,7 +108,7 @@ const setExportSelection = (eventId: string, checked: unknown): void => {
     <PageHeader
       eyebrow="交付物"
       title="契约导出"
-      description="选择事件和格式，生成可直接交付给客户端、数据与服务团队的事件契约文件。"
+      description="导出内容只认送审时冻结的事件、属性和依赖关系，会签期间的契约改动不会混入交付物。"
     />
 
     <div class="export-layout">
@@ -102,6 +116,25 @@ const setExportSelection = (eventId: string, checked: unknown): void => {
         <div class="panel-header">
           <h2 class="panel-title">导出范围</h2>
           <span class="muted">{{ selectedEventIds.length }} 个事件</span>
+        </div>
+        <div class="release-picker">
+          <label>发布候选</label>
+          <t-select
+            v-model="releaseId"
+            :options="
+              store.data.releases.map((item) => ({
+                label: `${item.version} ${item.title}`,
+                value: item.id,
+              }))
+            "
+          />
+          <template v-if="release">
+            <div class="freeze-meta">
+              <StatusTag :value="release.status" />
+              <span>血缘摘要 #{{ release.snapshot.overallDigest }}</span>
+              <span>冻结于 {{ new Date(release.snapshot.frozenAt).toLocaleString('zh-CN') }}</span>
+            </div>
+          </template>
         </div>
         <div class="format-options">
           <label>
@@ -119,26 +152,22 @@ const setExportSelection = (eventId: string, checked: unknown): void => {
             </span>
           </label>
         </div>
-        <label class="deprecated-option">
-          <t-checkbox v-model="includeDeprecated" />
-          <span>包含已废弃但仍保留历史口径的事件</span>
-        </label>
         <div class="event-checklist">
-          <label v-for="event in eligibleEvents" :key="event.id" class="event-check">
+          <label v-for="event in frozenEvents" :key="event.eventId" class="event-check">
             <t-checkbox
-              :value="selectedEventIds.includes(event.id)"
-              @change="setExportSelection(event.id, $event)"
+              :value="selectedEventIds.includes(event.eventId)"
+              @change="setExportSelection(event.eventId, $event)"
             />
             <span>
               <strong>{{ event.displayName }}</strong>
-              <small>{{ event.key }} · {{ event.version }}</small>
+              <small>{{ event.key }} · {{ event.version }} · #{{ event.digest }}</small>
             </span>
-            <StatusTag :value="event.status" />
           </label>
+          <div v-if="frozenEvents.length === 0" class="empty-state">该候选没有冻结事件。</div>
         </div>
-        <t-button theme="primary" class="download-button" @click="download">
+        <t-button theme="primary" class="download-button" :disabled="!release" @click="download">
           <template #icon><DownloadIcon /></template>
-          导出契约
+          导出冻结契约
         </t-button>
       </aside>
 
@@ -168,6 +197,25 @@ const setExportSelection = (eventId: string, checked: unknown): void => {
   position: sticky;
   top: 82px;
   padding-bottom: 16px;
+}
+
+.release-picker {
+  display: grid;
+  gap: 10px;
+  padding: 14px 16px;
+}
+
+.release-picker > label {
+  color: #596579;
+  font-size: 12px;
+}
+
+.freeze-meta {
+  display: grid;
+  gap: 6px;
+  justify-items: start;
+  color: #7a8494;
+  font-size: 11px;
 }
 
 .format-options {
@@ -200,15 +248,6 @@ const setExportSelection = (eventId: string, checked: unknown): void => {
   line-height: 1.4;
 }
 
-.deprecated-option {
-  display: flex;
-  align-items: center;
-  gap: 9px;
-  padding: 14px 16px;
-  color: #596579;
-  font-size: 12px;
-}
-
 .event-checklist {
   max-height: 420px;
   overflow: auto;
@@ -217,7 +256,7 @@ const setExportSelection = (eventId: string, checked: unknown): void => {
 
 .event-check {
   display: grid;
-  grid-template-columns: 28px minmax(0, 1fr) auto;
+  grid-template-columns: 28px minmax(0, 1fr);
   align-items: center;
   gap: 8px;
   padding: 11px 16px;

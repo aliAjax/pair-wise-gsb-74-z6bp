@@ -88,23 +88,57 @@ export interface ContractDifference {
   enumChanges: string[]
 }
 
+export type ConfirmationStatus = 'pending' | 'confirmed' | 'rejected' | 'invalidated'
+
 export interface MigrationConfirmation {
   id: string
   dependencyId: string
   version: string
-  status: 'pending' | 'confirmed' | 'rejected'
+  status: ConfirmationStatus
   reviewer: string
   note: string
   confirmedAt?: string
+  invalidatedAt?: string
+  invalidatedReason?: string
 }
+
+export type ApprovalStatus = 'pending' | 'approved' | 'rejected' | 'invalidated'
 
 export interface ReleaseApproval {
   id: string
   role: 'data' | 'product' | 'client' | 'qa'
   actor: string
-  status: 'pending' | 'approved' | 'rejected'
+  status: ApprovalStatus
   comment: string
   createdAt?: string
+  invalidatedAt?: string
+  invalidatedReason?: string
+}
+
+export interface FrozenEventContract {
+  eventId: string
+  key: string
+  displayName: string
+  version: string
+  trigger: string
+  owner: string
+  properties: EventProperty[]
+  platformRules: PlatformRule[]
+  digest: string
+}
+
+export interface FrozenDependencyRef {
+  dependencyId: string
+  name: string
+  owner: string
+  digest: string
+}
+
+export interface ReleaseSnapshot {
+  frozenAt: string
+  overallDigest: string
+  events: FrozenEventContract[]
+  dependencies: FrozenDependencyRef[]
 }
 
 export interface ReleaseCandidate {
@@ -117,6 +151,10 @@ export interface ReleaseCandidate {
   differences: ContractDifference[]
   migrationConfirmations: MigrationConfirmation[]
   approvals: ReleaseApproval[]
+  snapshot: ReleaseSnapshot
+  revision: number
+  idempotencyKey?: string
+  processedSubmissionIds: string[]
   createdAt: string
   publishedAt?: string
 }
@@ -143,6 +181,7 @@ export interface RollbackRecord {
   createdAt: string
   status: 'executed' | 'verified'
   evidence: string
+  restoredEventIds: string[]
 }
 
 export interface AuditEvent {

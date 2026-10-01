@@ -49,7 +49,7 @@ const localAdapter: AxiosAdapter = async (config) => {
       ).length,
       dependencyCount: state.dependencies.length,
       pendingMigrations:
-        currentRelease?.migrationConfirmations.filter((item) => item.status === 'pending').length ?? 0,
+        currentRelease?.migrationConfirmations.filter((item) => item.status !== 'confirmed').length ?? 0,
       validationIssueCount: issues.length,
       criticalIssueCount: issues.filter((issue) => issue.severity === 'critical').length,
       currentRelease,

@@ -7,12 +7,15 @@ import {
   ChevronRightIcon,
   CloseCircleIcon,
   DownloadIcon,
+  RefreshIcon,
 } from 'tdesign-icons-vue-next'
 import { MessagePlugin } from 'tdesign-vue-next'
 import PageHeader from '@/components/PageHeader.vue'
 import StatusTag from '@/components/StatusTag.vue'
 import { useReleaseQuery, useReleasesQuery } from '@/composables/useGovernanceQueries'
 import type { ReleaseApproval } from '@/models/domain'
+import { createId } from '@/services/repository'
+import { detectReleaseDrift, emptyDrift } from '@/services/releaseSnapshot'
 import { releaseReadiness } from '@/services/selectors'
 import { useGovernanceStore } from '@/stores/governance'
 
@@ -31,22 +34,37 @@ const release = computed(
     store.data.releases.find((item) => item.id === releaseId.value) ??
     null,
 )
+const storeRelease = computed(
+  () => store.data.releases.find((item) => item.id === releaseId.value) ?? null,
+)
 const releases = computed(() => releasesQuery.data.value ?? store.data.releases)
 const readiness = computed(() => (release.value ? releaseReadiness(release.value, store.issues) : 0))
+const drift = computed(() =>
+  storeRelease.value ? detectReleaseDrift(store.data, storeRelease.value) : null,
+)
+const hasDrift = computed(() => (drift.value ? !emptyDrift(drift.value) : false))
+const currentRevision = computed(() => storeRelease.value?.revision ?? 0)
 
 const createVisible = ref(false)
 const migrationVisible = ref(false)
 const approvalVisible = ref(false)
+const creating = ref(false)
+const migrationSubmitting = ref(false)
+const approvalSubmitting = ref(false)
+const batchSubmitting = ref(false)
 const createForm = reactive({
   version: '',
   title: '',
   eventIds: [] as string[],
+  idempotencyKey: '',
 })
 const migrationForm = reactive({
   confirmationId: '',
   reviewer: '',
   note: '',
 })
+const migrationSubmission = reactive({ expectedRevision: 0, submissionId: '' })
+const approvalSubmission = reactive({ expectedRevision: 0, submissionId: '' })
 const selectedApprovalIds = ref<string[]>([])
 const approvalComment = ref('')
 const singleApproval = ref<ReleaseApproval | null>(null)
@@ -71,6 +89,7 @@ const openCreate = (): void => {
   createForm.version = `2026.${String(Number(store.data.currentVersion.split('.')[1] ?? 10) + 1).padStart(2, '0')}.0`
   createForm.title = ''
   createForm.eventIds = []
+  createForm.idempotencyKey = createId('relsub')
   createVisible.value = true
 }
 
@@ -79,11 +98,22 @@ const createRelease = async (): Promise<void> => {
     await MessagePlugin.error('版本号、标题和事件范围不能为空')
     return
   }
-  const created = store.createRelease(createForm.version, createForm.title, createForm.eventIds)
-  releaseId.value = created.id
-  createVisible.value = false
-  await invalidate()
-  await MessagePlugin.success('发布候选已创建，已生成下游迁移清单')
+  if (creating.value) return
+  creating.value = true
+  try {
+    const created = store.createRelease(
+      createForm.version,
+      createForm.title,
+      createForm.eventIds,
+      createForm.idempotencyKey,
+    )
+    releaseId.value = created.id
+    createVisible.value = false
+    await invalidate()
+    await MessagePlugin.success('发布候选已创建，送审内容已冻结并生成下游迁移清单')
+  } finally {
+    creating.value = false
+  }
 }
 
 const openMigration = (confirmationId: string): void => {
@@ -94,80 +124,157 @@ const openMigration = (confirmationId: string): void => {
   migrationForm.confirmationId = confirmationId
   migrationForm.reviewer = confirmation.reviewer
   migrationForm.note = confirmation.note
+  migrationSubmission.expectedRevision = currentRevision.value
+  migrationSubmission.submissionId = createId('sub')
   migrationVisible.value = true
 }
 
 const confirmMigration = async (): Promise<void> => {
-  if (!release.value || !migrationForm.reviewer.trim() || !migrationForm.note.trim()) {
+  if (!release.value || migrationSubmitting.value) return
+  if (!migrationForm.reviewer.trim() || !migrationForm.note.trim()) {
     await MessagePlugin.error('确认人和迁移说明不能为空')
     return
   }
-  store.confirmMigration(
-    release.value.id,
-    migrationForm.confirmationId,
-    migrationForm.reviewer,
-    migrationForm.note,
-  )
-  migrationVisible.value = false
-  await invalidate()
-  await MessagePlugin.success('下游迁移已确认')
+  migrationSubmitting.value = true
+  try {
+    const result = store.confirmMigration(
+      release.value.id,
+      migrationForm.confirmationId,
+      migrationForm.reviewer,
+      migrationForm.note,
+      {
+        expectedRevision: migrationSubmission.expectedRevision,
+        submissionId: migrationSubmission.submissionId,
+      },
+    )
+    if (!result.ok) {
+      if (result.reason === 'conflict') {
+        await invalidate()
+        migrationSubmission.expectedRevision = currentRevision.value
+        await MessagePlugin.error('该候选刚被其他窗口更新（版本冲突），已载入最新意见，请核对后重新提交')
+        return
+      }
+      await MessagePlugin.error('该确认当前状态不可提交，请刷新后重试')
+      return
+    }
+    migrationVisible.value = false
+    await invalidate()
+    await MessagePlugin.success(result.duplicated ? '该提交已处理，未重复生成确认' : '下游迁移已确认')
+  } finally {
+    migrationSubmitting.value = false
+  }
 }
 
 const openApproval = (approval: ReleaseApproval): void => {
   singleApproval.value = approval
   approvalComment.value = approval.comment
+  approvalSubmission.expectedRevision = currentRevision.value
+  approvalSubmission.submissionId = createId('sub')
   approvalVisible.value = true
 }
 
 const submitApproval = async (status: ReleaseApproval['status']): Promise<void> => {
-  if (!release.value || !singleApproval.value || !approvalComment.value.trim()) {
+  if (!release.value || !singleApproval.value || approvalSubmitting.value) return
+  if (!approvalComment.value.trim()) {
     await MessagePlugin.error('审批意见不能为空')
     return
   }
-  store.updateApproval(
-    release.value.id,
-    singleApproval.value.role,
-    status,
-    singleApproval.value.actor,
-    approvalComment.value,
-  )
-  approvalVisible.value = false
-  await invalidate()
-  await MessagePlugin.success(status === 'approved' ? '审批已通过' : '审批已驳回')
+  approvalSubmitting.value = true
+  try {
+    const result = store.updateApproval(
+      release.value.id,
+      singleApproval.value.role,
+      status,
+      singleApproval.value.actor,
+      approvalComment.value,
+      {
+        expectedRevision: approvalSubmission.expectedRevision,
+        submissionId: approvalSubmission.submissionId,
+      },
+    )
+    if (!result.ok) {
+      if (result.reason === 'conflict') {
+        await invalidate()
+        approvalSubmission.expectedRevision = currentRevision.value
+        await MessagePlugin.error('该候选刚被其他窗口更新（版本冲突），已载入最新意见，请核对后重新提交')
+        return
+      }
+      await MessagePlugin.error('该审批当前状态不可提交，请刷新后重试')
+      return
+    }
+    approvalVisible.value = false
+    await invalidate()
+    await MessagePlugin.success(status === 'approved' ? '审批已通过' : '审批已驳回')
+  } finally {
+    approvalSubmitting.value = false
+  }
 }
 
 const batchApprove = async (): Promise<void> => {
-  if (!release.value) return
+  if (!release.value || batchSubmitting.value) return
   if (selectedApprovalIds.value.length === 0 || !approvalComment.value.trim()) {
     await MessagePlugin.error('请选择审批项并填写批量审批意见')
     return
   }
-  selectedApprovalIds.value.forEach((id) => {
-    const approval = release.value?.approvals.find((item) => item.id === id)
-    if (approval) {
-      store.updateApproval(
-        release.value!.id,
+  batchSubmitting.value = true
+  try {
+    for (const id of selectedApprovalIds.value) {
+      const approval = release.value?.approvals.find((item) => item.id === id)
+      if (!approval) continue
+      const result = store.updateApproval(
+        release.value.id,
         approval.role,
         'approved',
         approval.actor,
         approvalComment.value,
+        { expectedRevision: currentRevision.value, submissionId: createId('sub') },
       )
+      if (!result.ok) {
+        if (result.reason === 'conflict') {
+          await invalidate()
+          await MessagePlugin.error('批量审批期间候选被其他窗口更新，已中止并刷新，请核对后重试')
+          return
+        }
+        await MessagePlugin.error('部分审批提交失败，请刷新后重试')
+        return
+      }
     }
-  })
-  selectedApprovalIds.value = []
-  approvalComment.value = ''
+    selectedApprovalIds.value = []
+    approvalComment.value = ''
+    await invalidate()
+    await MessagePlugin.success('批量审批已提交')
+  } finally {
+    batchSubmitting.value = false
+  }
+}
+
+const refreeze = async (): Promise<void> => {
+  if (!release.value) return
+  const result = store.refreshReleaseSnapshot(release.value.id)
+  if (!result.ok) {
+    await MessagePlugin.error('当前候选状态不支持重新送审')
+    return
+  }
   await invalidate()
-  await MessagePlugin.success('批量审批已提交')
+  await MessagePlugin.success('已按当前契约重新冻结，未受影响的确认继续保留')
 }
 
 const publish = async (): Promise<void> => {
   if (!release.value) return
-  if (!store.publishRelease(release.value.id)) {
-    await MessagePlugin.error('迁移确认或四角色审批尚未完成，当前不可发布')
+  const result = store.publishRelease(release.value.id)
+  if (!result.ok) {
+    if (result.reason === 'drift') {
+      await MessagePlugin.error('当前契约与送审冻结内容不一致，请先重新送审冻结')
+    } else if (result.reason === 'gate') {
+      await MessagePlugin.error('迁移确认或四角色审批尚未完成，当前不可发布')
+    } else {
+      await MessagePlugin.error('当前候选状态不可发布')
+    }
+    await invalidate()
     return
   }
   await invalidate()
-  await MessagePlugin.success('事件契约版本已发布')
+  await MessagePlugin.success('事件契约版本已按送审冻结内容发布')
 }
 
 const downloadDiff = (): void => {
@@ -175,6 +282,9 @@ const downloadDiff = (): void => {
   const content = JSON.stringify(
     {
       release: release.value.version,
+      frozenAt: release.value.snapshot.frozenAt,
+      lineageDigest: release.value.snapshot.overallDigest,
+      revision: release.value.revision,
       events: release.value.eventIds.map(eventName),
       differences: release.value.differences,
       affectedDependencies: release.value.affectedDependencyIds.map(dependencyName),
@@ -204,7 +314,7 @@ const setApprovalChecked = (approvalId: string, checked: unknown): void => {
     <PageHeader
       eyebrow="发布门禁"
       title="版本差异与发布评审"
-      description="比较发布候选契约，生成受影响依赖，要求迁移确认并完成数据、产品、客户端和测试四角色审批。"
+      description="送审时冻结事件契约与血缘摘要，审批、迁移确认和导出均以冻结内容为准；契约或血缘变化会使受影响的确认即时失效。"
     />
 
     <section class="panel filter-panel">
@@ -230,6 +340,22 @@ const setApprovalChecked = (approvalId: string, checked: unknown): void => {
     </section>
 
     <template v-if="release">
+      <section v-if="hasDrift && release.status === 'reviewing'" class="drift-banner">
+        <div>
+          <strong>送审后事件契约或血缘已变化</strong>
+          <span>
+            <template v-if="drift && drift.eventDrifts.length > 0">
+              事件 {{ drift.eventDrifts.map((item) => item.eventKey).join('、') }} 与冻结内容不一致；
+            </template>
+            {{ drift?.dependencyDrifts.length ?? 0 }} 个下游依赖的血缘受影响，相关确认已失效退回重审，未受影响的确认继续保留。
+          </span>
+        </div>
+        <t-button theme="warning" variant="outline" @click="refreeze">
+          <template #icon><RefreshIcon /></template>
+          按当前契约重新送审
+        </t-button>
+      </section>
+
       <section class="release-overview">
         <div>
           <span>版本</span>
@@ -245,12 +371,18 @@ const setApprovalChecked = (approvalId: string, checked: unknown): void => {
           <strong>{{ release.eventIds.length }} 个</strong>
         </div>
         <div>
+          <span>血缘摘要</span>
+          <strong class="digest">#{{ release.snapshot.overallDigest }}</strong>
+          <small>冻结于 {{ new Date(release.snapshot.frozenAt).toLocaleString('zh-CN') }}</small>
+        </div>
+        <div>
           <span>发布就绪度</span>
           <strong>{{ readiness }}%</strong>
+          <small>候选版本 r{{ release.revision }}</small>
         </div>
         <t-button
           theme="primary"
-          :disabled="release.status === 'published' || release.status === 'rolled_back'"
+          :disabled="release.status !== 'reviewing'"
           @click="publish"
         >
           发布契约
@@ -261,7 +393,7 @@ const setApprovalChecked = (approvalId: string, checked: unknown): void => {
       <div class="release-grid">
         <section class="panel">
           <div class="panel-header">
-            <h2 class="panel-title">契约差异</h2>
+            <h2 class="panel-title">契约差异（送审冻结）</h2>
             <span class="muted">{{ release.differences.length }} 个事件发生变化</span>
           </div>
           <div class="diff-list">
@@ -321,10 +453,11 @@ const setApprovalChecked = (approvalId: string, checked: unknown): void => {
           </div>
           <div class="gate-list">
             <div class="gate-row">
-              <CheckCircleIcon />
+              <CheckCircleIcon :class="{ pending: hasDrift }" />
               <div>
-                <strong>契约差异已生成</strong>
-                <span>{{ release.differences.length }} 个事件参与比较</span>
+                <strong>送审内容已冻结</strong>
+                <span v-if="hasDrift">契约或血缘已漂移，需重新送审</span>
+                <span v-else>血缘摘要 #{{ release.snapshot.overallDigest }}，与当前契约一致</span>
               </div>
             </div>
             <div class="gate-row">
@@ -339,6 +472,11 @@ const setApprovalChecked = (approvalId: string, checked: unknown): void => {
                   {{
                     release.migrationConfirmations.filter((item) => item.status === 'confirmed').length
                   }}/{{ release.migrationConfirmations.length }} 已确认
+                  <template
+                    v-if="release.migrationConfirmations.some((item) => item.status === 'invalidated')"
+                  >
+                    · {{ release.migrationConfirmations.filter((item) => item.status === 'invalidated').length }} 已失效
+                  </template>
                 </span>
               </div>
             </div>
@@ -353,6 +491,9 @@ const setApprovalChecked = (approvalId: string, checked: unknown): void => {
                     release.approvals.length
                   }}
                   已通过
+                  <template v-if="release.approvals.some((item) => item.status === 'invalidated')">
+                    · {{ release.approvals.filter((item) => item.status === 'invalidated').length }} 已失效
+                  </template>
                 </span>
               </div>
             </div>
@@ -382,13 +523,16 @@ const setApprovalChecked = (approvalId: string, checked: unknown): void => {
               </div>
               <StatusTag :value="confirmation.status" />
               <p>{{ confirmation.note || '尚未填写迁移确认说明。' }}</p>
+              <p v-if="confirmation.status === 'invalidated'" class="invalidated-reason">
+                {{ confirmation.invalidatedReason ?? '确认已失效，需重新确认。' }}
+              </p>
               <t-button
                 variant="outline"
                 size="small"
                 :disabled="confirmation.status === 'confirmed'"
                 @click="openMigration(confirmation.id)"
               >
-                确认迁移
+                {{ confirmation.status === 'invalidated' ? '重新确认' : '确认迁移' }}
               </t-button>
             </article>
           </div>
@@ -408,6 +552,9 @@ const setApprovalChecked = (approvalId: string, checked: unknown): void => {
               <div>
                 <strong>{{ roleLabel(approval.role) }}</strong>
                 <span>{{ approval.actor }} · {{ approval.comment || '待填写意见' }}</span>
+                <span v-if="approval.status === 'invalidated'" class="invalidated-reason">
+                  {{ approval.invalidatedReason ?? '审批已失效，需重新审批。' }}
+                </span>
               </div>
               <StatusTag :value="approval.status" />
               <t-button variant="text" size="small" @click.prevent="openApproval(approval)">
@@ -417,7 +564,7 @@ const setApprovalChecked = (approvalId: string, checked: unknown): void => {
           </div>
           <div class="batch-bar">
             <t-input v-model="approvalComment" placeholder="批量审批意见" />
-            <t-button theme="primary" @click="batchApprove">批量通过</t-button>
+            <t-button theme="primary" :loading="batchSubmitting" @click="batchApprove">批量通过</t-button>
           </div>
         </section>
       </div>
@@ -454,7 +601,7 @@ const setApprovalChecked = (approvalId: string, checked: unknown): void => {
       </div>
       <div class="dialog-footer">
         <t-button variant="outline" @click="createVisible = false">取消</t-button>
-        <t-button theme="primary" @click="createRelease">创建并比较</t-button>
+        <t-button theme="primary" :loading="creating" @click="createRelease">创建并冻结</t-button>
       </div>
     </t-dialog>
 
@@ -471,7 +618,7 @@ const setApprovalChecked = (approvalId: string, checked: unknown): void => {
       </div>
       <div class="dialog-footer">
         <t-button variant="outline" @click="migrationVisible = false">取消</t-button>
-        <t-button theme="primary" @click="confirmMigration">确认迁移</t-button>
+        <t-button theme="primary" :loading="migrationSubmitting" @click="confirmMigration">确认迁移</t-button>
       </div>
     </t-dialog>
 
@@ -486,11 +633,11 @@ const setApprovalChecked = (approvalId: string, checked: unknown): void => {
       </div>
       <div class="dialog-footer">
         <t-button variant="outline" @click="approvalVisible = false">取消</t-button>
-        <t-button theme="danger" @click="submitApproval('rejected')">
+        <t-button theme="danger" :loading="approvalSubmitting" @click="submitApproval('rejected')">
           <template #icon><CloseCircleIcon /></template>
           驳回
         </t-button>
-        <t-button theme="primary" @click="submitApproval('approved')">
+        <t-button theme="primary" :loading="approvalSubmitting" @click="submitApproval('approved')">
           <template #icon><CheckCircleIcon /></template>
           通过
         </t-button>
@@ -508,9 +655,35 @@ const setApprovalChecked = (approvalId: string, checked: unknown): void => {
   min-width: 390px;
 }
 
+.drift-banner {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  padding: 14px 16px;
+  border: 1px solid #f0c36d;
+  border-radius: 6px;
+  background: #fff8ec;
+}
+
+.drift-banner > div {
+  display: grid;
+  gap: 4px;
+}
+
+.drift-banner strong {
+  color: #8a5a00;
+  font-size: 13px;
+}
+
+.drift-banner span {
+  color: #7a6529;
+  font-size: 12px;
+}
+
 .release-overview {
   display: grid;
-  grid-template-columns: 180px minmax(260px, 1fr) 130px 140px auto;
+  grid-template-columns: 150px minmax(220px, 1fr) 110px 210px 150px auto;
   align-items: center;
   gap: 1px;
   overflow: hidden;
@@ -527,6 +700,7 @@ const setApprovalChecked = (approvalId: string, checked: unknown): void => {
 .release-overview > div {
   display: grid;
   gap: 6px;
+  align-content: start;
   padding: 14px 16px;
   background: #fff;
 }
@@ -534,6 +708,16 @@ const setApprovalChecked = (approvalId: string, checked: unknown): void => {
 .release-overview span {
   color: #717c8e;
   font-size: 11px;
+}
+
+.release-overview small {
+  color: #8a93a3;
+  font-size: 10px;
+}
+
+.release-overview .digest {
+  font-family: monospace;
+  font-size: 13px;
 }
 
 .release-overview > button {
@@ -656,6 +840,11 @@ const setApprovalChecked = (approvalId: string, checked: unknown): void => {
   grid-column: 1 / -1;
   margin: 0;
   line-height: 1.5;
+}
+
+.migration-card .invalidated-reason,
+.approval-row .invalidated-reason {
+  color: #b42318;
 }
 
 .migration-card :deep(.t-button) {

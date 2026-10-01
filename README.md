@@ -34,4 +34,21 @@ npm run build
 - `src/services/api.ts`：Axios 实例与本地 API 适配器
 - `src/composables/useGovernanceQueries.ts`：TanStack Query 查询组合
 - `src/stores/governance.ts`：Pinia 编辑、审批、废弃和回滚状态
+- `src/services/releaseSnapshot.ts`：送审冻结、血缘摘要与契约漂移检测
 - `src/services/selectors.ts`：契约比较、影响分析和校验规则
+- `src/services/repository.ts`：localStorage 持久化，写入前保留备份，损坏时从最后一个完整状态恢复
+
+## 发布评审一致性
+
+- 每次送审把事件契约、平台规则和下游依赖冻结进发布候选，并计算血缘摘要；审批、迁移确认、导出和发布只认冻结内容
+- 会签期间事件或血缘变化时，受影响依赖的未发布确认即时失效退回重审，未受影响的确认继续保留；可按当前契约重新送审冻结
+- 迁移确认和审批提交携带候选版本号（乐观锁），后到提交遇到版本冲突会被拒绝并载入最新意见，不会覆盖他人提交
+- 提交带幂等键，重试不会重复生成确认；写入失败从最后一个完整状态恢复；回滚按候选冻结内容还原事件契约
+
+## 验证
+
+```bash
+npm run verify
+```
+
+覆盖冻结、漂移失效、粒度保留、乐观锁冲突、幂等重试、发布门禁、回滚还原和崩溃恢复共 39 项断言。
