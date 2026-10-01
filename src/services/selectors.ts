@@ -335,17 +335,25 @@ export const releaseReadiness = (
 ): number => {
   const migrationTotal = release.migrationConfirmations.length
   const migrationDone = release.migrationConfirmations.filter(
-    (item) => item.status === 'confirmed',
+    (item) => item.status === 'confirmed' && !item.invalidated,
   ).length
   const approvalTotal = release.approvals.length
-  const approvalDone = release.approvals.filter((item) => item.status === 'approved').length
+  const approvalDone = release.approvals.filter(
+    (item) => item.status === 'approved' && !item.invalidated,
+  ).length
+  const invalidatedCount =
+    release.migrationConfirmations.filter((item) => item.invalidated).length +
+    release.approvals.filter((item) => item.invalidated).length
   const issuePenalty = Math.min(
     40,
     issues.filter((issue) => release.eventIds.includes(issue.entityId)).length * 8,
   )
   const migrationScore = migrationTotal === 0 ? 40 : (migrationDone / migrationTotal) * 40
   const approvalScore = approvalTotal === 0 ? 30 : (approvalDone / approvalTotal) * 30
-  return Math.max(0, Math.round(migrationScore + approvalScore + 30 - issuePenalty))
+  // 血缘变更退回重审期间，就绪度封顶 60，旧审批/旧确认不再放行。
+  const raw = migrationScore + approvalScore + 30 - issuePenalty - invalidatedCount * 6
+  const capped = invalidatedCount > 0 ? Math.min(raw, 60) : raw
+  return Math.max(0, Math.round(capped))
 }
 
 export const propertyReferences = (

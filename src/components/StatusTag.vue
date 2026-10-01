@@ -31,6 +31,7 @@ const labels: Record<string, string> = {
   executed: '已执行',
   verified: '已验证',
   rolled_back: '已回滚',
+  invalidated: '已失效',
   duplicate_event: '重复事件',
   synonym_property: '同义属性',
   naming_violation: '命名问题',

@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, reactive, ref } from 'vue'
+import { computed, onMounted, onUnmounted, reactive, ref, watch } from 'vue'
 import { useQueryClient } from '@tanstack/vue-query'
 import {
   AddIcon,
@@ -7,12 +7,17 @@ import {
   ChevronRightIcon,
   CloseCircleIcon,
   DownloadIcon,
+  ErrorCircleIcon,
+  LockOnIcon,
+  RefreshIcon,
 } from 'tdesign-icons-vue-next'
 import { MessagePlugin } from 'tdesign-vue-next'
 import PageHeader from '@/components/PageHeader.vue'
 import StatusTag from '@/components/StatusTag.vue'
 import { useReleaseQuery, useReleasesQuery } from '@/composables/useGovernanceQueries'
 import type { ReleaseApproval } from '@/models/domain'
+import { releaseDrift } from '@/services/freeze'
+import { VersionConflictError } from '@/services/repository'
 import { releaseReadiness } from '@/services/selectors'
 import { useGovernanceStore } from '@/stores/governance'
 
@@ -34,6 +39,16 @@ const release = computed(
 const releases = computed(() => releasesQuery.data.value ?? store.data.releases)
 const readiness = computed(() => (release.value ? releaseReadiness(release.value, store.issues) : 0))
 
+/** 乐观锁：本窗口打开候选时看到的版本号，提交时必须仍等于它。 */
+const expectedRevision = ref(0)
+const refreshRevision = (): void => {
+  expectedRevision.value = release.value?.revision ?? 0
+}
+watch(
+  () => release.value?.id,
+  () => refreshRevision(),
+)
+
 const createVisible = ref(false)
 const migrationVisible = ref(false)
 const approvalVisible = ref(false)
@@ -41,6 +56,7 @@ const createForm = reactive({
   version: '',
   title: '',
   eventIds: [] as string[],
+  requestId: '',
 })
 const migrationForm = reactive({
   confirmationId: '',
@@ -51,7 +67,27 @@ const selectedApprovalIds = ref<string[]>([])
 const approvalComment = ref('')
 const singleApproval = ref<ReleaseApproval | null>(null)
 
+const drift = computed(() =>
+  release.value ? releaseDrift(store.data, release.value) : { drifted: false, changedEventIds: [], changedDependencyIds: [] },
+)
+const frozenAtText = computed(() =>
+  release.value?.frozenSnapshot
+    ? new Date(release.value.frozenSnapshot.frozenAt).toLocaleString('zh-CN')
+    : '',
+)
+const lineageDigestShort = computed(() =>
+  release.value?.frozenSnapshot?.lineageDigest.slice(0, 8) ?? '',
+)
+const invalidatedConfirmations = computed(
+  () => release.value?.migrationConfirmations.filter((item) => item.invalidated) ?? [],
+)
+const invalidatedApprovals = computed(
+  () => release.value?.approvals.filter((item) => item.invalidated) ?? [],
+)
+
 const eventName = (eventId: string): string => {
+  const frozen = release.value?.frozenSnapshot?.events.find((item) => item.event.id === eventId)
+  if (frozen) return `${frozen.event.displayName} (${frozen.event.key})`
   const event = store.data.events.find((item) => item.id === eventId)
   return event ? `${event.displayName} (${event.key})` : eventId
 }
@@ -65,12 +101,25 @@ const invalidate = async (): Promise<void> => {
   await queryClient.invalidateQueries({ queryKey: ['releases'] })
   await queryClient.invalidateQueries({ queryKey: ['dashboard'] })
   await queryClient.invalidateQueries({ queryKey: ['lineage'] })
+  refreshRevision()
 }
+
+const onRemoteUpdate = (): void => {
+  void invalidate()
+  void MessagePlugin.warning('检测到其他窗口已提交该候选，本地版本已刷新')
+}
+onMounted(() => {
+  refreshRevision()
+  window.addEventListener('eventrail:remote-update', onRemoteUpdate)
+})
+onUnmounted(() => window.removeEventListener('eventrail:remote-update', onRemoteUpdate))
 
 const openCreate = (): void => {
   createForm.version = `2026.${String(Number(store.data.currentVersion.split('.')[1] ?? 10) + 1).padStart(2, '0')}.0`
   createForm.title = ''
   createForm.eventIds = []
+  // 幂等键在打开弹窗时生成一次；写入失败后重试复用它，不重复生成迁移确认。
+  createForm.requestId = `request-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 6)}`
   createVisible.value = true
 }
 
@@ -79,11 +128,32 @@ const createRelease = async (): Promise<void> => {
     await MessagePlugin.error('版本号、标题和事件范围不能为空')
     return
   }
-  const created = store.createRelease(createForm.version, createForm.title, createForm.eventIds)
-  releaseId.value = created.id
-  createVisible.value = false
-  await invalidate()
-  await MessagePlugin.success('发布候选已创建，已生成下游迁移清单')
+  try {
+    const result = store.createRelease(
+      createForm.version,
+      createForm.title,
+      createForm.eventIds,
+      createForm.requestId,
+    )
+    releaseId.value = result.release.id
+    createVisible.value = false
+    await invalidate()
+    await MessagePlugin.success(
+      result.recovered
+        ? '已从写入前的完整候选恢复，未重复生成迁移确认'
+        : '发布候选已冻结送审，已生成下游迁移清单',
+    )
+  } catch {
+    await MessagePlugin.error(
+      `写入失败，已从最后一个完整候选恢复（${store.writeError ?? '未知错误'}）。请直接重试，不会重复生成确认。`,
+    )
+  }
+}
+
+const injectWriteFailure = async (): Promise<void> => {
+  const { setFailNextWrite } = await import('@/services/repository')
+  setFailNextWrite(true)
+  await MessagePlugin.warning('下一次写入将模拟失败，可重试创建/确认观察恢复行为')
 }
 
 const openMigration = (confirmationId: string): void => {
@@ -102,20 +172,32 @@ const confirmMigration = async (): Promise<void> => {
     await MessagePlugin.error('确认人和迁移说明不能为空')
     return
   }
-  store.confirmMigration(
-    release.value.id,
-    migrationForm.confirmationId,
-    migrationForm.reviewer,
-    migrationForm.note,
-  )
-  migrationVisible.value = false
-  await invalidate()
-  await MessagePlugin.success('下游迁移已确认')
+  try {
+    store.confirmMigration(
+      release.value.id,
+      migrationForm.confirmationId,
+      migrationForm.reviewer,
+      migrationForm.note,
+      expectedRevision.value,
+    )
+    migrationVisible.value = false
+    await invalidate()
+    await MessagePlugin.success('下游迁移已按冻结血缘确认')
+  } catch (error) {
+    if (error instanceof VersionConflictError) {
+      await invalidate()
+      await MessagePlugin.error(
+        `版本冲突：该候选刚被其他窗口更新（r${error.actualRevision}），你的意见未覆盖对方提交，请刷新后重提`,
+      )
+    } else {
+      await MessagePlugin.error('写入失败，已从最后一个完整候选恢复，请重试')
+    }
+  }
 }
 
 const openApproval = (approval: ReleaseApproval): void => {
   singleApproval.value = approval
-  approvalComment.value = approval.comment
+  approvalComment.value = approval.invalidated ? '' : approval.comment
   approvalVisible.value = true
 }
 
@@ -124,16 +206,28 @@ const submitApproval = async (status: ReleaseApproval['status']): Promise<void> 
     await MessagePlugin.error('审批意见不能为空')
     return
   }
-  store.updateApproval(
-    release.value.id,
-    singleApproval.value.role,
-    status,
-    singleApproval.value.actor,
-    approvalComment.value,
-  )
-  approvalVisible.value = false
-  await invalidate()
-  await MessagePlugin.success(status === 'approved' ? '审批已通过' : '审批已驳回')
+  try {
+    store.updateApproval(
+      release.value.id,
+      singleApproval.value.role,
+      status,
+      singleApproval.value.actor,
+      approvalComment.value,
+      expectedRevision.value,
+    )
+    approvalVisible.value = false
+    await invalidate()
+    await MessagePlugin.success(status === 'approved' ? '审批已通过' : '审批已驳回')
+  } catch (error) {
+    if (error instanceof VersionConflictError) {
+      await invalidate()
+      await MessagePlugin.error(
+        `版本冲突：该候选刚被其他窗口更新（r${error.actualRevision}），你的意见未覆盖对方提交，请刷新后重提`,
+      )
+    } else {
+      await MessagePlugin.error('写入失败，已从最后一个完整候选恢复，请重试')
+    }
+  }
 }
 
 const batchApprove = async (): Promise<void> => {
@@ -142,32 +236,49 @@ const batchApprove = async (): Promise<void> => {
     await MessagePlugin.error('请选择审批项并填写批量审批意见')
     return
   }
-  selectedApprovalIds.value.forEach((id) => {
-    const approval = release.value?.approvals.find((item) => item.id === id)
-    if (approval) {
+  try {
+    for (const id of selectedApprovalIds.value) {
+      const approval = store.data.releases
+        .find((item) => item.id === release.value!.id)
+        ?.approvals.find((item) => item.id === id)
+      if (!approval) continue
       store.updateApproval(
-        release.value!.id,
+        release.value.id,
         approval.role,
         'approved',
         approval.actor,
         approvalComment.value,
+        expectedRevision.value,
       )
+      // 每次成功提交后跟随最新修订号，保证同窗口连续提交不被自己判定为冲突。
+      expectedRevision.value += 1
     }
-  })
-  selectedApprovalIds.value = []
-  approvalComment.value = ''
-  await invalidate()
-  await MessagePlugin.success('批量审批已提交')
+    selectedApprovalIds.value = []
+    approvalComment.value = ''
+    await invalidate()
+    await MessagePlugin.success('批量审批已提交')
+  } catch (error) {
+    await invalidate()
+    await MessagePlugin.error(
+      error instanceof VersionConflictError
+        ? `版本冲突：该候选刚被其他窗口更新（r${error.actualRevision}），批量审批已中断，未覆盖对方意见`
+        : '写入失败，已从最后一个完整候选恢复，请重试',
+    )
+  }
 }
 
 const publish = async (): Promise<void> => {
   if (!release.value) return
+  if (drift.value.drifted) {
+    await MessagePlugin.error('冻结之后事件或血缘已变化，受影响确认退回重审后才能发布')
+    return
+  }
   if (!store.publishRelease(release.value.id)) {
-    await MessagePlugin.error('迁移确认或四角色审批尚未完成，当前不可发布')
+    await MessagePlugin.error('迁移确认或四角色审批尚未全部完成（失效项不计入），当前不可发布')
     return
   }
   await invalidate()
-  await MessagePlugin.success('事件契约版本已发布')
+  await MessagePlugin.success('事件契约版本已按冻结快照发布')
 }
 
 const downloadDiff = (): void => {
@@ -175,6 +286,8 @@ const downloadDiff = (): void => {
   const content = JSON.stringify(
     {
       release: release.value.version,
+      frozenAt: release.value.frozenSnapshot?.frozenAt,
+      lineageDigest: release.value.frozenSnapshot?.lineageDigest,
       events: release.value.eventIds.map(eventName),
       differences: release.value.differences,
       affectedDependencies: release.value.affectedDependencyIds.map(dependencyName),
@@ -188,6 +301,18 @@ const downloadDiff = (): void => {
   const anchor = document.createElement('a')
   anchor.href = url
   anchor.download = `${release.value.version}-contract-diff.json`
+  anchor.click()
+  URL.revokeObjectURL(url)
+}
+
+const downloadFrozen = (): void => {
+  if (!release.value) return
+  const content = store.exportFrozenRelease(release.value.id)
+  const blob = new Blob([content], { type: 'application/json;charset=utf-8' })
+  const url = URL.createObjectURL(blob)
+  const anchor = document.createElement('a')
+  anchor.href = url
+  anchor.download = `${release.value.version}-frozen-contract.json`
   anchor.click()
   URL.revokeObjectURL(url)
 }
@@ -221,11 +346,50 @@ const setApprovalChecked = (approvalId: string, checked: unknown): void => {
             <template #icon><DownloadIcon /></template>
             导出差异
           </t-button>
+          <t-button variant="outline" :disabled="!release?.frozenSnapshot" @click="downloadFrozen">
+            <template #icon><LockOnIcon /></template>
+            导出冻结契约
+          </t-button>
+          <t-button variant="outline" theme="warning" @click="injectWriteFailure">
+            <template #icon><ErrorCircleIcon /></template>
+            模拟下次写入失败
+          </t-button>
           <t-button theme="primary" @click="openCreate">
             <template #icon><AddIcon /></template>
             创建发布候选
           </t-button>
         </div>
+      </div>
+    </section>
+
+    <section v-if="release?.frozenSnapshot" class="panel freeze-banner" :class="{ drifted: drift.drifted }">
+      <LockOnIcon />
+      <div class="freeze-text">
+        <strong>
+          送审冻结于 {{ frozenAtText }} · 血缘摘要 {{ lineageDigestShort }} · 修订 r{{ release.revision }}
+        </strong>
+        <span>审批、迁移确认与导出均以送审时冻结的事件、属性和依赖关系为准。</span>
+      </div>
+      <StatusTag v-if="drift.drifted" value="invalidated" />
+      <StatusTag v-else value="confirmed" />
+      <div v-if="store.lastRecovery" class="freeze-recovery">
+        <RefreshIcon />
+        <span>
+          上次写入失败后已于 {{ new Date(store.lastRecovery.recoveredAt).toLocaleTimeString('zh-CN') }}
+          从最后一个完整候选恢复{{ store.lastRecovery.requestId ? `（${store.lastRecovery.requestId}）` : '' }}
+        </span>
+      </div>
+    </section>
+
+    <section v-if="drift.drifted" class="panel drift-panel">
+      <ErrorCircleIcon />
+      <div>
+        <strong>冻结血缘已漂移，受影响的未发布确认已退回重审</strong>
+        <p>
+          变化事件：{{ drift.changedEventIds.map(eventName).join('、') || '无' }}；
+          受影响下游：{{ drift.changedDependencyIds.map(dependencyName).join('、') || '无' }}。
+          未受影响的迁移确认继续保留；所有审批均需按当前契约重新会签后才能放行。
+        </p>
       </div>
     </section>
 
@@ -330,29 +494,44 @@ const setApprovalChecked = (approvalId: string, checked: unknown): void => {
             <div class="gate-row">
               <CheckCircleIcon
                 :class="{
-                  pending: release.migrationConfirmations.some((item) => item.status !== 'confirmed'),
+                  pending: release.migrationConfirmations.some(
+                    (item) => item.status !== 'confirmed' || item.invalidated,
+                  ),
                 }"
               />
               <div>
                 <strong>下游迁移确认</strong>
                 <span>
                   {{
-                    release.migrationConfirmations.filter((item) => item.status === 'confirmed').length
+                    release.migrationConfirmations.filter(
+                      (item) => item.status === 'confirmed' && !item.invalidated,
+                    ).length
                   }}/{{ release.migrationConfirmations.length }} 已确认
+                  <em v-if="invalidatedConfirmations.length">
+                    （{{ invalidatedConfirmations.length }} 项因血缘变化失效）
+                  </em>
                 </span>
               </div>
             </div>
             <div class="gate-row">
               <CheckCircleIcon
-                :class="{ pending: release.approvals.some((item) => item.status !== 'approved') }"
+                :class="{
+                  pending: release.approvals.some(
+                    (item) => item.status !== 'approved' || item.invalidated,
+                  ),
+                }"
               />
               <div>
                 <strong>四角色批量审批</strong>
                 <span>
-                  {{ release.approvals.filter((item) => item.status === 'approved').length }}/{{
-                    release.approvals.length
-                  }}
+                  {{
+                    release.approvals.filter((item) => item.status === 'approved' && !item.invalidated)
+                      .length
+                  }}/{{ release.approvals.length }}
                   已通过
+                  <em v-if="invalidatedApprovals.length">
+                    （{{ invalidatedApprovals.length }} 项旧意见已失效）
+                  </em>
                 </span>
               </div>
             </div>
@@ -375,20 +554,25 @@ const setApprovalChecked = (approvalId: string, checked: unknown): void => {
               v-for="confirmation in release.migrationConfirmations"
               :key="confirmation.id"
               class="migration-card"
+              :class="{ invalidated: confirmation.invalidated }"
             >
               <div>
                 <strong>{{ dependencyName(confirmation.dependencyId) }}</strong>
                 <span>{{ confirmation.reviewer || '未指定确认人' }}</span>
               </div>
-              <StatusTag :value="confirmation.status" />
-              <p>{{ confirmation.note || '尚未填写迁移确认说明。' }}</p>
+              <StatusTag v-if="confirmation.invalidated" value="invalidated" />
+              <StatusTag v-else :value="confirmation.status" />
+              <p v-if="confirmation.invalidated" class="invalidated-reason">
+                {{ confirmation.invalidatedReason }} · 旧确认已退回，请基于最新血缘重新确认
+              </p>
+              <p v-else>{{ confirmation.note || '尚未填写迁移确认说明。' }}</p>
               <t-button
                 variant="outline"
                 size="small"
-                :disabled="confirmation.status === 'confirmed'"
+                :disabled="!confirmation.invalidated && confirmation.status === 'confirmed'"
                 @click="openMigration(confirmation.id)"
               >
-                确认迁移
+                {{ confirmation.invalidated ? '重新确认迁移' : '确认迁移' }}
               </t-button>
             </article>
           </div>
@@ -399,19 +583,31 @@ const setApprovalChecked = (approvalId: string, checked: unknown): void => {
             <h2 class="panel-title">四角色审批</h2>
           </div>
           <div class="approval-list">
-            <label v-for="approval in release.approvals" :key="approval.id" class="approval-row">
+            <label
+              v-for="approval in release.approvals"
+              :key="approval.id"
+              class="approval-row"
+              :class="{ invalidated: approval.invalidated }"
+            >
               <t-checkbox
                 :value="selectedApprovalIds.includes(approval.id)"
-                :disabled="approval.status === 'approved'"
+                :disabled="!approval.invalidated && approval.status === 'approved'"
                 @change="setApprovalChecked(approval.id, $event)"
               />
               <div>
                 <strong>{{ roleLabel(approval.role) }}</strong>
-                <span>{{ approval.actor }} · {{ approval.comment || '待填写意见' }}</span>
+                <span>
+                  {{ approval.actor }} ·
+                  <template v-if="approval.invalidated">
+                    旧意见已失效：{{ approval.invalidatedReason }}
+                  </template>
+                  <template v-else>{{ approval.comment || '待填写意见' }}</template>
+                </span>
               </div>
-              <StatusTag :value="approval.status" />
+              <StatusTag v-if="approval.invalidated" value="invalidated" />
+              <StatusTag v-else :value="approval.status" />
               <t-button variant="text" size="small" @click.prevent="openApproval(approval)">
-                审批
+                {{ approval.invalidated ? '重新审批' : '审批' }}
               </t-button>
             </label>
           </div>
@@ -506,6 +702,91 @@ const setApprovalChecked = (approvalId: string, checked: unknown): void => {
 
 .release-field {
   min-width: 390px;
+}
+
+.freeze-banner {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  margin: 14px 0;
+  padding: 12px 16px;
+  border-left: 3px solid #0f8a62;
+}
+
+.freeze-banner.drifted {
+  border-left-color: #c46a00;
+  background: #fff8ed;
+}
+
+.freeze-banner svg {
+  color: #0f8a62;
+}
+
+.freeze-banner.drifted svg {
+  color: #c46a00;
+}
+
+.freeze-text {
+  display: grid;
+  gap: 3px;
+  margin-right: auto;
+}
+
+.freeze-text strong {
+  font-size: 12px;
+}
+
+.freeze-text span,
+.freeze-recovery {
+  color: #727d8f;
+  font-size: 11px;
+}
+
+.freeze-recovery {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.drift-panel {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  margin-bottom: 16px;
+  padding: 14px 16px;
+  border: 1px solid #f2d8a7;
+  background: #fff8ed;
+}
+
+.drift-panel svg {
+  margin-top: 2px;
+  color: #c46a00;
+}
+
+.drift-panel strong {
+  font-size: 13px;
+  color: #8a4b00;
+}
+
+.drift-panel p {
+  margin: 5px 0 0;
+  color: #7a5a2e;
+  font-size: 12px;
+  line-height: 1.6;
+}
+
+.migration-card.invalidated,
+.approval-row.invalidated {
+  background: #fff8ed;
+}
+
+.invalidated-reason {
+  color: #a15c00 !important;
+}
+
+.gate-row em {
+  color: #c46a00;
+  font-style: normal;
 }
 
 .release-overview {

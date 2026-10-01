@@ -6,6 +6,7 @@ import type {
   GovernanceState,
   ReleaseCandidate,
 } from './domain'
+import { buildFrozenSnapshot, reconcileRelease } from '@/services/freeze'
 
 const events: EventDefinition[] = [
   {
@@ -873,6 +874,8 @@ const releases: ReleaseCandidate[] = [
         comment: '',
       },
     ],
+    revision: 3,
+    requestId: 'request-rel-001',
     createdAt: '2026-09-25T10:30:00+08:00',
   },
   {
@@ -937,6 +940,8 @@ const releases: ReleaseCandidate[] = [
         createdAt: '2026-08-30T11:50:00+08:00',
       },
     ],
+    revision: 6,
+    requestId: 'request-rel-000',
     createdAt: '2026-08-25T09:00:00+08:00',
     publishedAt: '2026-08-30T12:00:00+08:00',
   },
@@ -981,9 +986,87 @@ const audit: AuditEvent[] = [
   },
 ]
 
-export const createSeedState = (): GovernanceState => ({
-  events,
-  scenarios: [
+/**
+ * 按送审时刻构造冻结视图：rel-001 在 2026-09-25 冻结，之后工程师
+ * 修改了 evt-001/evt-003 契约，因此冻结快照里保留修改前的属性血缘。
+ */
+const buildReviewingStateView = (): GovernanceState => {
+  const state: GovernanceState = {
+    events: structuredClone(events),
+    scenarios: [],
+    dependencies: structuredClone(dependencies),
+    baselines: structuredClone(baselines),
+    releases: [],
+    deprecations: [],
+    rollbacks: [],
+    audit: [],
+    currentVersion: '2026.10.0',
+  }
+  const orderSubmit = state.events.find((event) => event.id === 'evt-001')!
+  const orderId = orderSubmit.properties.find((property) => property.id === 'prop-001')!
+  orderId.type = 'number'
+
+  const searchClick = state.events.find((event) => event.id === 'evt-003')!
+  const pageNo = searchClick.properties.find((property) => property.id === 'prop-014')!
+  pageNo.type = 'string'
+  const clickType = searchClick.properties.find((property) => property.id === 'prop-013')!
+  clickType.enumValues = ['tap', 'voice']
+  return state
+}
+
+const attachFrozenSnapshots = (state: GovernanceState): void => {
+  const reviewing = state.releases.find((release) => release.id === 'rel-001')
+  if (reviewing && !reviewing.frozenSnapshot) {
+    const frozenAt = '2026-09-25T10:30:00+08:00'
+    const frozenView = buildReviewingStateView()
+    const { frozenSnapshot } = buildFrozenSnapshot(
+      frozenView,
+      reviewing.eventIds,
+      reviewing.affectedDependencyIds,
+      frozenAt,
+    )
+    reviewing.frozenSnapshot = frozenSnapshot
+    reviewing.migrationConfirmations.forEach((confirmation) => {
+      confirmation.frozenDigest = frozenSnapshot.dependencies.find(
+        (dependency) => dependency.id === confirmation.dependencyId,
+      )?.digest
+    })
+
+    // 首次加载即校准：工程师在会签期间改了契约，受影响的旧确认立即失效退回重审。
+    const outcome = reconcileRelease(state, reviewing, '2026-09-28T09:35:00+08:00')
+    if (outcome) {
+      state.audit.unshift({
+        id: 'aud-005',
+        entityType: 'release',
+        entityId: reviewing.id,
+        action: '血缘变更退回重审',
+        actor: '系统',
+        detail: `冻结之后事件/属性血缘变化，失效迁移确认 ${outcome.invalidatedConfirmationIds.length} 项、审批 ${outcome.invalidatedApprovalRoles.length} 项。`,
+        createdAt: '2026-09-28T09:35:00+08:00',
+      })
+    }
+  }
+
+  const published = state.releases.find((release) => release.id === 'rel-000')
+  if (published && !published.frozenSnapshot) {
+    published.frozenSnapshot = buildFrozenSnapshot(
+      state,
+      published.eventIds,
+      published.affectedDependencyIds,
+      published.publishedAt ?? published.createdAt,
+    ).frozenSnapshot
+    published.migrationConfirmations.forEach((confirmation) => {
+      confirmation.frozenDigest = published.frozenSnapshot!.dependencies.find(
+        (dependency) => dependency.id === confirmation.dependencyId,
+      )?.digest
+    })
+  }
+}
+
+export const createSeedState = (): GovernanceState => {
+  const state: GovernanceState = {
+    events,
+    scenarios: [
     {
       id: 'scn-001',
       name: '下单支付主链路',
@@ -1052,4 +1135,7 @@ export const createSeedState = (): GovernanceState => ({
   ],
   audit,
   currentVersion: '2026.10.0',
-})
+  }
+  attachFrozenSnapshots(state)
+  return state
+}

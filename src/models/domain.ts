@@ -78,6 +78,17 @@ export interface EventVersionSnapshot {
   status: 'published' | 'superseded'
 }
 
+export interface FrozenDependency {
+  id: string
+  name: string
+  type: DownstreamDependency['type']
+  owner: string
+  environment: DownstreamDependency['environment']
+  eventIds: string[]
+  propertyRefs: Array<{ eventId: string; propertyId: string }>
+  digest: string
+}
+
 export interface ContractDifference {
   eventId: string
   eventKey: string
@@ -96,6 +107,12 @@ export interface MigrationConfirmation {
   reviewer: string
   note: string
   confirmedAt?: string
+  /** 送审时该依赖的血缘摘要，事件/血缘变更后据此判定失效 */
+  frozenDigest?: string
+  /** 因冻结之后契约变更而失效，需下游重新确认 */
+  invalidated?: boolean
+  invalidatedReason?: string
+  invalidatedAt?: string
 }
 
 export interface ReleaseApproval {
@@ -105,6 +122,29 @@ export interface ReleaseApproval {
   status: 'pending' | 'approved' | 'rejected'
   comment: string
   createdAt?: string
+  /** 会签期间契约变更后，已提交意见失效并退回重审 */
+  invalidated?: boolean
+  invalidatedReason?: string
+  invalidatedAt?: string
+}
+
+export interface FrozenEventContract {
+  event: Pick<
+    EventDefinition,
+    | 'id'
+    | 'key'
+    | 'displayName'
+    | 'category'
+    | 'version'
+    | 'owner'
+    | 'trigger'
+    | 'description'
+  >
+  properties: EventProperty[]
+  platformRules: PlatformRule[]
+  downstreamDependencyIds: string[]
+  /** 事件契约（含属性）摘要 */
+  digest: string
 }
 
 export interface ReleaseCandidate {
@@ -117,6 +157,18 @@ export interface ReleaseCandidate {
   differences: ContractDifference[]
   migrationConfirmations: MigrationConfirmation[]
   approvals: ReleaseApproval[]
+  /** 送审时冻结的事件、属性、平台规则与下游依赖，审批/迁移/导出只认该内容 */
+  frozenSnapshot?: {
+    events: FrozenEventContract[]
+    dependencies: FrozenDependency[]
+    /** 候选整体血缘摘要，契约变更后用于识别过期候选 */
+    lineageDigest: string
+    frozenAt: string
+  }
+  /** 并发提交的乐观锁版本，每次成功写入后递增 */
+  revision: number
+  /** 送审请求幂等键，写入失败重试时不重复生成迁移确认 */
+  requestId?: string
   createdAt: string
   publishedAt?: string
 }

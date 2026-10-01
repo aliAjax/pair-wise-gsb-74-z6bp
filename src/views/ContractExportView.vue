@@ -14,10 +14,50 @@ const selectedEventIds = ref(
 )
 const format = ref<'json' | 'markdown'>('json')
 const includeDeprecated = ref(false)
+/** workspace：当前工作区；frozen：只认送审时冻结的事件、属性和依赖关系 */
+const scope = ref<'workspace' | 'frozen'>('workspace')
+const selectedReleaseId = ref(
+  store.data.releases.find((release) => release.status === 'reviewing')?.id ??
+    store.data.releases[0]?.id ??
+    '',
+)
+
+const releaseOptions = computed(() =>
+  store.data.releases.map((release) => ({
+    label: `${release.version} ${release.title}（冻结于 ${
+      release.frozenSnapshot
+        ? new Date(release.frozenSnapshot.frozenAt).toLocaleDateString('zh-CN')
+        : '无快照'
+    }）`,
+    value: release.id,
+  })),
+)
+const selectedRelease = computed(
+  () => store.data.releases.find((release) => release.id === selectedReleaseId.value) ?? null,
+)
 
 const eligibleEvents = computed(() =>
-  store.data.events.filter((event) => includeDeprecated.value || event.status !== 'retired'),
+  scope.value === 'frozen' && selectedRelease.value?.frozenSnapshot
+    ? selectedRelease.value.frozenSnapshot.events.map((frozen) => ({
+        id: frozen.event.id,
+        displayName: frozen.event.displayName,
+        key: frozen.event.key,
+        version: frozen.event.version,
+        status: 'reviewing' as const,
+      }))
+    : store.data.events.filter((event) => includeDeprecated.value || event.status !== 'retired'),
 )
+
+watch(scope, (value) => {
+  if (value === 'frozen' && selectedRelease.value?.frozenSnapshot) {
+    selectedEventIds.value = selectedRelease.value.eventIds
+  }
+})
+watch(selectedReleaseId, () => {
+  if (scope.value === 'frozen' && selectedRelease.value?.frozenSnapshot) {
+    selectedEventIds.value = selectedRelease.value.eventIds
+  }
+})
 
 watch(includeDeprecated, () => {
   selectedEventIds.value = selectedEventIds.value.filter((id) =>
@@ -26,6 +66,40 @@ watch(includeDeprecated, () => {
 })
 
 const markdown = computed(() => {
+  if (scope.value === 'frozen' && selectedRelease.value?.frozenSnapshot) {
+    const snapshot = selectedRelease.value.frozenSnapshot
+    const events = snapshot.events.filter((event) => selectedEventIds.value.includes(event.event.id))
+    return [
+      `# 埋点事件契约 ${selectedRelease.value.version}（送审冻结）`,
+      '',
+      `> 冻结时间：${new Date(snapshot.frozenAt).toLocaleString('zh-CN')} · 血缘摘要：${snapshot.lineageDigest.slice(0, 8)}`,
+      '',
+      ...events.flatMap((frozen) => [
+        `## ${frozen.event.displayName} (\`${frozen.event.key}\`)`,
+        '',
+        `- 版本：${frozen.event.version}`,
+        `- 负责人：${frozen.event.owner}`,
+        `- 触发时机：${frozen.event.trigger}`,
+        '',
+        '| 属性 | 类型 | 必填 | 枚举 | 说明 |',
+        '| --- | --- | --- | --- | --- |',
+        ...frozen.properties
+          .filter((property) => !property.deletedAt)
+          .map(
+            (property) =>
+              `| ${property.name} | ${property.type} | ${property.required ? '是' : '否'} | ${property.enumValues.join('/') || '-'} | ${property.description} |`,
+          ),
+        '',
+        '**平台差异（冻结）**',
+        '',
+        ...frozen.platformRules.map(
+          (rule) =>
+            `- ${rule.platform}: ${rule.enabled ? rule.trigger : '已停用'}（${rule.owner}）`,
+        ),
+        '',
+      ]),
+    ].join('\n')
+  }
   const events = store.data.events.filter((event) => selectedEventIds.value.includes(event.id))
   return [
     `# 埋点事件契约 ${store.data.currentVersion}`,
@@ -58,9 +132,13 @@ const markdown = computed(() => {
   ].join('\n')
 })
 
-const output = computed(() =>
-  format.value === 'json' ? store.exportContract(selectedEventIds.value) : markdown.value,
-)
+const output = computed(() => {
+  if (scope.value === 'frozen' && selectedRelease.value) {
+    if (format.value === 'json') return store.exportFrozenRelease(selectedRelease.value.id)
+    return markdown.value
+  }
+  return format.value === 'json' ? store.exportContract(selectedEventIds.value) : markdown.value
+})
 
 const download = async (): Promise<void> => {
   if (selectedEventIds.value.length === 0) {
@@ -76,10 +154,16 @@ const download = async (): Promise<void> => {
   const url = URL.createObjectURL(blob)
   const anchor = document.createElement('a')
   anchor.href = url
-  anchor.download = `event-contract-${store.data.currentVersion}.${extension}`
+  const versionPart =
+    scope.value === 'frozen' && selectedRelease.value
+      ? `${selectedRelease.value.version}-frozen`
+      : store.data.currentVersion
+  anchor.download = `event-contract-${versionPart}.${extension}`
   anchor.click()
   URL.revokeObjectURL(url)
-  await MessagePlugin.success('契约文件已导出')
+  await MessagePlugin.success(
+    scope.value === 'frozen' ? '已按送审冻结内容导出契约' : '契约文件已导出',
+  )
 }
 
 const setExportSelection = (eventId: string, checked: unknown): void => {
@@ -105,6 +189,29 @@ const setExportSelection = (eventId: string, checked: unknown): void => {
         </div>
         <div class="format-options">
           <label>
+            <input v-model="scope" type="radio" value="workspace" />
+            <span>
+              <strong>工作区口径</strong>
+              <small>按当前编辑中的事件契约导出</small>
+            </span>
+          </label>
+          <label>
+            <input v-model="scope" type="radio" value="frozen" />
+            <span>
+              <strong>送审冻结口径</strong>
+              <small>只认候选冻结时的事件、属性和依赖</small>
+            </span>
+          </label>
+        </div>
+        <div v-if="scope === 'frozen'" class="release-picker">
+          <label>发布候选</label>
+          <t-select v-model="selectedReleaseId" :options="releaseOptions" />
+          <p v-if="selectedRelease && !selectedRelease.frozenSnapshot" class="scope-warning">
+            该候选没有送审冻结快照，无法按冻结口径导出。
+          </p>
+        </div>
+        <div class="format-options">
+          <label>
             <input v-model="format" type="radio" value="json" />
             <span>
               <strong>JSON 契约</strong>
@@ -119,7 +226,7 @@ const setExportSelection = (eventId: string, checked: unknown): void => {
             </span>
           </label>
         </div>
-        <label class="deprecated-option">
+        <label v-if="scope === 'workspace'" class="deprecated-option">
           <t-checkbox v-model="includeDeprecated" />
           <span>包含已废弃但仍保留历史口径的事件</span>
         </label>
@@ -127,13 +234,15 @@ const setExportSelection = (eventId: string, checked: unknown): void => {
           <label v-for="event in eligibleEvents" :key="event.id" class="event-check">
             <t-checkbox
               :value="selectedEventIds.includes(event.id)"
+              :disabled="scope === 'frozen'"
               @change="setExportSelection(event.id, $event)"
             />
             <span>
               <strong>{{ event.displayName }}</strong>
               <small>{{ event.key }} · {{ event.version }}</small>
             </span>
-            <StatusTag :value="event.status" />
+            <StatusTag v-if="'status' in event" :value="event.status" />
+            <StatusTag v-else value="reviewing" />
           </label>
         </div>
         <t-button theme="primary" class="download-button" @click="download">
@@ -207,6 +316,24 @@ const setExportSelection = (eventId: string, checked: unknown): void => {
   padding: 14px 16px;
   color: #596579;
   font-size: 12px;
+}
+
+.release-picker {
+  display: grid;
+  gap: 8px;
+  padding: 14px 16px;
+  border-bottom: 1px solid #e8ebef;
+}
+
+.release-picker label {
+  font-size: 12px;
+  font-weight: 600;
+}
+
+.scope-warning {
+  margin: 0;
+  color: #c46a00;
+  font-size: 11px;
 }
 
 .event-checklist {

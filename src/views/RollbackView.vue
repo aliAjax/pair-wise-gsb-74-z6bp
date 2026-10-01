@@ -26,10 +26,14 @@ const verifyForm = reactive({
 })
 
 const rollbackRecords = computed(() =>
-  store.data.rollbacks.map((record) => ({
-    ...record,
-    release: store.data.releases.find((release) => release.id === record.releaseId),
-  })),
+  store.data.rollbacks.map((record) => {
+    const release = store.data.releases.find((item) => item.id === record.releaseId)
+    return {
+      ...record,
+      release,
+      frozenDigest: release?.frozenSnapshot?.lineageDigest.slice(0, 8) ?? '-',
+    }
+  }),
 )
 
 const openRollback = (): void => {
@@ -45,9 +49,13 @@ const execute = async (): Promise<void> => {
     await MessagePlugin.error('版本、回滚原因、影响范围和证据编号不能为空')
     return
   }
-  store.executeRollback(form.releaseId, form.reason, form.scope, form.evidence)
-  rollbackVisible.value = false
-  await MessagePlugin.success('回滚指令已记录，请继续执行结果验证')
+  try {
+    store.executeRollback(form.releaseId, form.reason, form.scope, form.evidence)
+    rollbackVisible.value = false
+    await MessagePlugin.success('已按原候选冻结内容回滚，请继续执行结果验证')
+  } catch (error) {
+    await MessagePlugin.error(error instanceof Error ? error.message : '回滚失败')
+  }
 }
 
 const openVerify = (rollbackId: string): void => {
@@ -72,7 +80,7 @@ const verify = async (): Promise<void> => {
     <PageHeader
       eyebrow="故障恢复"
       title="回滚与验证记录"
-      description="记录契约发布后的回滚原因、客户端影响范围、执行证据和业务验证结果。"
+      description="回滚恢复以原候选送审冻结的事件、属性和依赖关系为准，记录原因、客户端影响范围、执行证据和业务验证结果。"
     />
 
     <section class="panel filter-panel">
@@ -138,6 +146,10 @@ const verify = async (): Promise<void> => {
               <div>
                 <dt>执行时间</dt>
                 <dd>{{ new Date(record.createdAt).toLocaleString('zh-CN') }}</dd>
+              </div>
+              <div>
+                <dt>恢复依据</dt>
+                <dd>冻结摘要 {{ record.frozenDigest }}</dd>
               </div>
               <div>
                 <dt>验证证据</dt>
